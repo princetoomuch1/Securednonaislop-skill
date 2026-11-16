@@ -1,0 +1,14 @@
+{
+  "name": "vibe-preflight",
+  "owner": { "name": "Prince K. Parmar", "url": "https://github.com/princetoomuch1" },
+  "metadata": { "description": "Ship AI-built apps without the AI-built mistakes." },
+  "plugins": [
+    {
+      "name": "vibe-preflight",
+      "source": "./",
+      "description": "Pre-launch audit, deploy gate and guardrails for vibe-coded apps (Lovable, Bolt, v0, Cursor, Replit, Claude Code).",
+      "version": "1.0.0",
+      "category": "security"
+    }
+  ]
+}

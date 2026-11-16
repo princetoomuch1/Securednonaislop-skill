@@ -1,0 +1,14 @@
+{
+  "name": "vibe-preflight-render",
+  "private": true,
+  "type": "module",
+  "description": "Rendered checks for vibe-preflight (consent capture, axe-core, keyboard, overflow, links).",
+  "scripts": {
+    "setup": "npm install && npx playwright install chromium",
+    "audit": "node render_audit.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.0",
+    "playwright": "^1.48.0"
+  }
+}

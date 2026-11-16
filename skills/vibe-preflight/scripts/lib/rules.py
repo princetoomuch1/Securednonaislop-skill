@@ -1,0 +1,306 @@
+"""Line/regex rules for vibe-preflight.
+
+Each rule: id, sev (P0/P1/P2), cat, title, pattern (regex), exts (file extensions
+or None for all text files), fix, and optional flags:
+  - scope: "source" (default), "build" (only built output), "both"
+  - multiline: run on whole file with DOTALL instead of per line
+  - skip_if: regex; if it matches anywhere in the same file, rule is skipped
+  - aggregate: report one finding with a count instead of every hit
+  - only_paths: regex the relative path must match
+  - not_paths: regex the relative path must not match
+  - confidence: high / medium / low
+"""
+import re
+
+CODE = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro"}
+MARKUP = {".html", ".htm", ".jsx", ".tsx", ".vue", ".svelte", ".astro", ".md", ".mdx"}
+STYLE = {".css", ".scss", ".sass", ".less"}
+WEB = CODE | MARKUP | STYLE
+PY = {".py"}
+SERVER = CODE | PY
+ANY = None
+
+TEST_PATHS = r"(^|/)(__tests__|tests?|spec|e2e|cypress|playwright|fixtures?|mocks?|stories)(/|$)|\.(test|spec|stories)\."
+
+RULES = [
+    # ---------------- Security: secrets ----------------
+    dict(id="S-01", sev="P0", cat="security", title="Stripe live secret key in code",
+         pattern=r"\b(sk|rk)_live_[0-9A-Za-z]{16,}", exts=ANY, scope="both",
+         fix="Move to a server-only env var, rotate the key in the Stripe dashboard now."),
+    dict(id="S-01", sev="P0", cat="security", title="OpenAI / Anthropic API key in code",
+         pattern=r"\bsk-(?:proj-|ant-(?:api\d+-)?)?[A-Za-z0-9_\-]{24,}", exts=ANY, scope="both",
+         fix="Call the model from a server route; rotate the key."),
+    dict(id="S-01", sev="P0", cat="security", title="AWS access key id in code",
+         pattern=r"\b(AKIA|ASIA)[0-9A-Z]{16}\b", exts=ANY, scope="both",
+         fix="Remove, rotate in IAM, use a role or server env var."),
+    dict(id="S-01", sev="P0", cat="security", title="GitHub token in code",
+         pattern=r"\bgh[pousr]_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{60,}", exts=ANY, scope="both",
+         fix="Revoke the token on GitHub; use repository secrets."),
+    dict(id="S-01", sev="P0", cat="security", title="Slack token in code",
+         pattern=r"\bxox[baprs]-[A-Za-z0-9-]{10,}", exts=ANY, scope="both",
+         fix="Revoke in Slack admin; store server-side."),
+    dict(id="S-01", sev="P0", cat="security", title="Private key material in code",
+         pattern=r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----", exts=ANY, scope="both",
+         fix="Remove from repo and history; generate a new key pair."),
+    dict(id="S-01", sev="P0", cat="security", title="Email/SMS provider key in code",
+         pattern=r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b|\bre_[A-Za-z0-9]{24,}\b|\bSK[0-9a-f]{32}\b",
+         exts=ANY, scope="both", confidence="medium",
+         fix="Rotate the key (SendGrid / Resend / Twilio) and send mail only from the server."),
+    dict(id="S-01", sev="P0", cat="security", title="Database URL with password in code",
+         pattern=r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s:/@'\"]+:[^\s@'\"]{3,}@[^\s'\"]+",
+         exts=ANY, scope="both", not_paths=r"\.env(\.example|\.sample|\.template)$|README",
+         fix="Use a server env var; rotate the DB password."),
+    dict(id="S-01", sev="P0", cat="security", title="Secret exposed through a public env prefix",
+         pattern=r"\b(?:NEXT_PUBLIC|VITE|REACT_APP|PUBLIC|EXPO_PUBLIC|NUXT_PUBLIC|GATSBY)_[A-Z0-9_]*(?:SECRET|SERVICE_ROLE|PRIVATE|OPENAI|ANTHROPIC|STRIPE_SECRET|DATABASE_URL|DB_PASS|WEBHOOK)[A-Z0-9_]*",
+         exts=ANY, fix="Public prefixes ship to the browser. Rename without the prefix and read it only on the server."),
+    dict(id="S-01", sev="P2", cat="security", title="Google API key in code (verify it is restricted)",
+         pattern=r"\bAIza[0-9A-Za-z_\-]{35}\b", exts=ANY, scope="both", aggregate=True, confidence="low",
+         fix="Firebase web keys are public by design. Restrict Maps/other Google keys by HTTP referrer and API in Cloud Console."),
+
+    # ---------------- Security: backend rules ----------------
+    dict(id="S-05", sev="P0", cat="security", title="Firebase rules allow everyone",
+         pattern=r"allow\s+(?:read|write|get|list|create|update|delete)(?:\s*,\s*(?:read|write|get|list|create|update|delete))*\s*:\s*if\s+true\b",
+         exts={".rules"}, fix="Require auth and ownership: allow read, write: if request.auth != null && request.auth.uid == resource.data.ownerId;"),
+    dict(id="S-05", sev="P0", cat="security", title="Firebase rules use the 30-day test-mode expiry",
+         pattern=r"request\.time\s*<\s*timestamp\.date\(", exts={".rules"},
+         fix="Test mode rules open the whole database until a date. Replace with auth and ownership rules."),
+    dict(id="S-03", sev="P0", cat="security", title="Supabase policy allows every row",
+         pattern=r"(?is)create\s+policy[^;]*?using\s*\(\s*true\s*\)", exts={".sql"}, multiline=True,
+         fix="Scope policies to the owner: USING (auth.uid() = user_id). Keep USING (true) only for public lookup tables."),
+    dict(id="S-03", sev="P0", cat="security", title="Supabase RLS disabled",
+         pattern=r"(?i)disable\s+row\s+level\s+security", exts={".sql"},
+         fix="Enable RLS on every table in the public schema and add owner policies."),
+    dict(id="S-07", sev="P1", cat="security", title="Database function executable by anon",
+         pattern=r"(?i)grant\s+execute\s+on\s+function[^;]*\bto\s+(?:anon|public)\b", exts={".sql"},
+         fix="Revoke from anon; check auth.uid() inside SECURITY DEFINER functions."),
+    dict(id="S-07", sev="P1", cat="security", title="SECURITY DEFINER function (verify it checks the caller)",
+         pattern=r"(?i)security\s+definer", exts={".sql"}, confidence="medium",
+         fix="Inside the function, check auth.uid() and set search_path = ''."),
+    dict(id="S-06", sev="P0", cat="security", title="Public storage bucket",
+         pattern=r"(?i)insert\s+into\s+storage\.buckets[^;]*\btrue\b|createBucket\([^)]*public\s*:\s*true",
+         exts={".sql"} | CODE, fix="Make the bucket private and serve files with signed URLs."),
+
+    # ---------------- Security: code ----------------
+    dict(id="S-16", sev="P1", cat="security", title="dangerouslySetInnerHTML without sanitizer",
+         pattern=r"(?s)dangerouslySetInnerHTML\s*=\s*\{\{\s*__html\s*:(?!\s*JSON\.stringify)", multiline=True, exts=CODE, skip_if=r"DOMPurify|sanitize-html|isomorphic-dompurify|xss\(", confidence="medium",
+         fix="Sanitize with DOMPurify first, or render as text."),
+    dict(id="S-16", sev="P1", cat="security", title="Raw HTML sink (v-html / {@html} / set:html / innerHTML)",
+         pattern=r"\bv-html=|\{@html\s|set:html=|\.innerHTML\s*=(?!=)|\.outerHTML\s*=(?!=)|document\.write\(|insertAdjacentHTML\(",
+         exts=WEB, skip_if=r"DOMPurify|sanitize-html|isomorphic-dompurify",
+         fix="Sanitize with DOMPurify or use textContent."),
+    dict(id="S-16", sev="P1", cat="security", title="eval / new Function on dynamic input",
+         pattern=r"\beval\(\s*[a-zA-Z_]|new Function\(", exts=CODE, not_paths=TEST_PATHS,
+         fix="Remove eval; parse data with JSON.parse or a real parser."),
+    dict(id="S-17", sev="P0", cat="security", title="SQL built with string interpolation",
+         pattern=r"(?is)(?:query|execute|queryRawUnsafe|executeRawUnsafe|\.unsafe|\.raw|prepare)\s*\(\s*`[^`]{0,400}?\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]{0,400}?\$\{",
+         exts=CODE, multiline=True, fix="Use parameterised queries ($1, ?) or the ORM's tagged template."),
+    dict(id="S-17", sev="P0", cat="security", title="SQL built with f-string / concatenation (Python)",
+         pattern=r"(?i)\.execute\(\s*(?:f[\"']|[\"'][^\"']*(?:SELECT|INSERT|UPDATE|DELETE)[^\"']*[\"']\s*(?:\+|%))",
+         exts=PY, fix="Use cursor.execute(sql, params)."),
+    dict(id="S-17", sev="P1", cat="security", title="NoSQL operator injection risk",
+         pattern=r"\$where|find\(\s*(?:req|request)\.(?:body|query)\s*\)", exts=CODE,
+         fix="Validate input with a schema; never pass request objects straight to Mongo filters."),
+    dict(id="S-14", sev="P0", cat="security", title="Server fetches a user-supplied URL (SSRF)",
+         pattern=r"(?:fetch|axios(?:\.(?:get|post|request))?|got|request|urlopen|requests\.(?:get|post))\(\s*(?:req|request|body|data|input|payload|params|searchParams|args)\??\.(?:body\.|query\.|params\.)?(?:url|uri|link|href|target|imageUrl|image_url|webhook|callback|endpoint)\b",
+         exts=SERVER, fix="Allowlist hosts, block private IP ranges (10/8, 172.16/12, 192.168/16, 169.254/16, ::1), disable redirects."),
+    dict(id="S-13", sev="P0", cat="security", title="Placeholder security check returns true",
+         pattern=r"(?is)(?:function|const|def)\s+(?:is_?\w*(?:auth|admin|authori[sz]ed|allowed|valid|owner)\w*|verify\w*|check_?\w*(?:perm|auth|access)\w*|can_?\w+)\s*(?:=\s*(?:async\s*)?)?\([^)]*\)\s*(?:=>|:)?\s*\{?\s*(?:#[^\n]*\n\s*|//[^\n]*\n\s*)?return\s+(?:true|True)\b",
+         exts=SERVER, multiline=True, not_paths=TEST_PATHS,
+         fix="Implement the check against the session and database, or delete the stub."),
+    dict(id="S-13", sev="P1", cat="security", title="Unfinished security work (TODO/FIXME on auth)",
+         pattern=r"(?i)(?://|#|/\*)\s*(?:TODO|FIXME|XXX|HACK)\b[^\n]{0,80}\b(?:auth|security|permission|validat|verif|sanitiz|rate.?limit|csrf|rls|password|encrypt)",
+         exts=SERVER | {".sql"}, fix="Finish the check before launch."),
+    dict(id="S-13", sev="P0", cat="security", title="Hardcoded password / OTP comparison",
+         pattern=r"(?i)\b(?:password|passwd|pwd|otp|pin|code|secret)\s*===?\s*[\"'][^\"'\s]{3,}[\"']",
+         exts=SERVER, not_paths=TEST_PATHS, fix="Compare against a hashed value from the database (bcrypt/argon2) or the provider."),
+    dict(id="S-11", sev="P1", cat="security", title="Request body written straight to the database (mass assignment)",
+         pattern=r"\.(?:update|create|insert|upsert|updateOne|findOneAndUpdate|findByIdAndUpdate)\(\s*(?:\{\s*\.\.\.)?(?:req\.body|body|await\s+req(?:uest)?\.json\(\)|data|input)\s*\}?\s*[,)]",
+         exts=CODE, confidence="medium",
+         fix="Pick allowed fields with a Zod schema; never let the client set role, isAdmin, price, user_id."),
+    dict(id="S-12", sev="P0", cat="security", title="Price or amount taken from the client",
+         pattern=r"(?i)(?:unit_amount|amount|price|total)\s*:\s*(?:req\.body|body|data|input|params)\.(?:price|amount|total|unit_amount|cost)",
+         exts=CODE, fix="Look the price up on the server from your product table or Stripe Price ID."),
+    dict(id="S-10", sev="P1", cat="security", title="User id taken from the request (possible IDOR)",
+         pattern=r"(?:req\.body|body|params|searchParams\.get\()\.?\(?[\"']?(?:userId|user_id|ownerId|owner_id|accountId)\b",
+         exts=SERVER, confidence="medium",
+         fix="Derive the user from the session (auth.uid / getServerSession), then check ownership."),
+    dict(id="S-20", sev="P1", cat="security", title="Auth token stored in localStorage",
+         pattern=r"localStorage\.setItem\(\s*[\"'`](?:token|jwt|access_?token|id_?token|auth|session|refresh_?token)",
+         exts=CODE, fix="Use httpOnly, Secure, SameSite cookies set by the server."),
+    dict(id="S-20", sev="P0", cat="security", title="JWT 'none' algorithm accepted / decode used as verify",
+         pattern=r"algorithms\s*:\s*\[[^\]]*[\"']none[\"']|\bjwt\.decode\([^)]*\)\s*(?:;|\n)[^\n]*(?:role|admin|userId|sub)",
+         exts=SERVER, fix="Use jwt.verify with an explicit algorithm list and secret."),
+    dict(id="S-21", sev="P1", cat="security", title="CORS allows any origin",
+         pattern=r"Access-Control-Allow-Origin[\"']?\s*[,:=]\s*[\"']\*|origin\s*:\s*[\"']\*[\"']|origin\s*:\s*true\b|cors\(\s*\)",
+         exts=SERVER | {".json", ".toml"}, fix="Allowlist your own origins, especially on routes that use cookies."),
+    dict(id="S-25", sev="P0", cat="security", title="LLM SDK allowed in the browser",
+         pattern=r"dangerouslyAllowBrowser\s*:\s*true", exts=CODE,
+         fix="Proxy model calls through a server route that holds the key, with auth and a per-user rate limit."),
+    dict(id="S-22", sev="P1", cat="security", title="Source maps shipped to production",
+         pattern=r"productionBrowserSourceMaps\s*:\s*true|sourcemap\s*:\s*true|devtool\s*:\s*[\"']source-map",
+         exts=CODE, fix="Disable public source maps or upload them privately to your error tracker."),
+    dict(id="S-22", sev="P1", cat="security", title="Debug mode left on",
+         pattern=r"(?i)^\s*DEBUG\s*=\s*True\b|app\.run\([^)]*debug\s*=\s*True", exts=PY,
+         fix="Turn debug off in production."),
+
+    # ---------------- Legal ----------------
+    dict(id="L-02", sev="P0", cat="legal", title="Template placeholders in legal text",
+         pattern=r"(?i)\[(?:company|your company|company name|date|address|email|jurisdiction|state|country)\]|your company name|\{\{\s*company",
+         exts=WEB | {".txt"}, only_paths=r"(?i)privacy|terms|legal|cookie|imprint|impressum|refund|policy",
+         fix="Fill in the real legal entity, address, contact and dates; have a lawyer review."),
+    dict(id="L-04", sev="P0", cat="legal", title="Testimonial uses stock or generated avatar (likely fabricated)",
+         pattern=r"randomuser\.me|pravatar\.cc|i\.pravatar|ui-avatars\.com|thispersondoesnotexist|api\.dicebear\.com|xsgames\.co/randomusers|images\.unsplash\.com/photo-[^\"'\s]*(?:face|portrait|crop=faces)",
+         exts=WEB | {".json"}, confidence="medium",
+         fix="Use only real, permissioned testimonials with real photos, or remove the section. FTC 16 CFR 465 / UK DMCC ban fake reviews."),
+    dict(id="L-05", sev="P1", cat="legal", title="User/customer count claim (needs proof)",
+         pattern=r"(?i)\b\d{1,3}(?:[,.]\d{3})*(?:\.\d)?\s*[kKmM]?\s*\+?\s*(?:happy\s+|satisfied\s+|active\s+)?(?:users|customers|clients|teams|companies|developers|downloads|businesses|creators|members|students|brands)\b",
+         exts=MARKUP | CODE, not_paths=TEST_PATHS, aggregate=False, confidence="medium",
+         fix="Keep only numbers you can prove today. Invented counts are deceptive advertising."),
+    dict(id="L-05", sev="P1", cat="legal", title="'Trusted by' / 'As seen in' claim (needs proof and logo permission)",
+         pattern=r"(?i)\b(?:trusted|loved|used)\s+by\s+(?:\d|thousands|millions|teams|leading|top|the world)|\bas\s+seen\s+(?:in|on)\b|\bfeatured\s+in\b",
+         exts=MARKUP | CODE, not_paths=TEST_PATHS,
+         fix="Show only real customers or press, with permission to use their logos."),
+    dict(id="L-05", sev="P1", cat="legal", title="Star rating shown in UI (needs real review source)",
+         pattern=r"(?i)\b[45]\.\d\s*(?:/\s*5|out of 5|stars?|★)|★★★★★|\b(?:rated|rating)\s+[45]\.\d",
+         exts=MARKUP | CODE, not_paths=TEST_PATHS,
+         fix="Show ratings only from a verifiable source and link to it."),
+    dict(id="L-06", sev="P1", cat="legal", title="Review / AggregateRating structured data (verify it is real and not self-serving)",
+         pattern=r"[\"']@type[\"']\s*:\s*[\"'](?:AggregateRating|Review)[\"']|aggregateRating",
+         exts=WEB | {".json"},
+         fix="Remove unless reviews are genuine, visible on the page, and not about your own Organization/LocalBusiness."),
+    dict(id="L-10", sev="P1", cat="legal", title="Google Fonts loaded from Google's CDN (EU: IP transfer without consent)",
+         pattern=r"fonts\.(?:googleapis|gstatic)\.com", exts=WEB,
+         fix="Self-host fonts (next/font/google does this automatically, or download the files)."),
+    dict(id="L-13", sev="P1", cat="legal", title="Unsubstantiated compliance or security claim",
+         pattern=r"(?i)\b(?:GDPR|HIPAA|SOC\s?2|ISO\s?27001|PCI)[\s-]+(?:compliant|certified|ready)\b|\bbank[\s-](?:level|grade)\s+(?:security|encryption)\b|\bmilitary[\s-]grade\b|\b100%\s+secure\b|\bunhackable\b",
+         exts=MARKUP | CODE, fix="Remove unless you hold the certification or audit and can show it."),
+
+    # ---------------- UX ----------------
+    dict(id="U-01", sev="P1", cat="ux", title="Dead link or empty click handler",
+         pattern=r"href=[\"']#[\"']|href=\{?[\"']javascript:void|onClick=\{\s*\(\)\s*=>\s*\{\s*\}\s*\}|onClick=\{\s*\(\)\s*=>\s*console\.log",
+         exts=MARKUP | CODE, aggregate=True, fix="Wire the action or remove the control."),
+    dict(id="U-18", sev="P1", cat="ux", title="Placeholder content left in UI",
+         pattern=r"(?i)lorem ipsum|\byour company\b|\bacme (?:inc|corp)\b|\bjohn doe\b|\bjane doe\b|\bcoming soon\b|\bplaceholder text\b|\binsert (?:text|image) here\b",
+         exts=MARKUP | CODE, not_paths=TEST_PATHS, aggregate=True, fix="Replace with real content before launch."),
+    dict(id="U-30", sev="P1", cat="ux", title="Fake urgency or activity from random numbers",
+         pattern=r"(?i)Math\.(?:random|floor\(Math\.random)[^\n]{0,120}(?:view|watch|left|stock|people|online|bought|sold|visitor|remaining|spots)",
+         exts=CODE, fix="Show only real stock/activity data. Fake urgency is a banned dark pattern (India CCPA, EU UCPD, FTC)."),
+    dict(id="U-32", sev="P1", cat="ux", title="Pre-ticked marketing or consent checkbox",
+         pattern=r"(?i)<input[^>]*(?:defaultChecked|checked)(?:=\{true\})?[^>]*(?:newsletter|marketing|offers|promo|subscribe|consent|terms|updates)|(?:newsletter|marketing|offers|promo|subscribe|consent|terms)[^\n>]{0,80}(?:defaultChecked|checked=\{true\}|checked\b)",
+         exts=MARKUP | CODE, fix="Leave opt-in boxes unchecked by default."),
+    dict(id="U-14", sev="P1", cat="ux", title="Scroll-jacking (wheel/touch listener with preventDefault)",
+         pattern=r"(?is)[\"'](?:wheel|mousewheel|touchmove|DOMMouseScroll)[\"'][^;]{0,300}?preventDefault",
+         exts=CODE, multiline=True, fix="Use native scroll; respect prefers-reduced-motion."),
+    dict(id="U-21", sev="P1", cat="ux", title="Autoplaying carousel or video",
+         pattern=r"\bautoPlay\b(?!\s*=\s*\{false\})|\bautoplay\b(?!\s*[:=]\s*false)", exts=MARKUP | CODE,
+         confidence="medium", fix="Disable autoplay or give a visible pause control (WCAG 2.2.2)."),
+
+    # ---------------- Accessibility ----------------
+    dict(id="F-02", sev="P1", cat="a11y", title="Image without alt attribute",
+         pattern=r"<(?:img|Image)\s+(?=[a-zA-Z{])(?![^>]*\balt\s*=)[^>]*>", exts=MARKUP | {".js"}, aggregate=True,
+         fix="Add meaningful alt text, or alt=\"\" for decoration."),
+    dict(id="F-03", sev="P1", cat="a11y", title="Click handler on a div/span (not keyboard accessible)",
+         pattern=r"<(?:div|span|li|td|img|p)\b(?![^>]*\brole=)[^>]*\bon[Cc]lick=", exts=MARKUP | CODE, aggregate=True,
+         fix="Use <button> or <a>. If you must, add role, tabIndex=0 and Enter/Space handlers."),
+    dict(id="F-05", sev="P1", cat="a11y", title="Focus outline removed without replacement",
+         pattern=r"outline\s*:\s*(?:none|0)\b|\bfocus:outline-none\b(?![^\"'`]*focus(?:-visible)?:ring)|\boutline-none\b(?![^\"'`]*(?:focus(?:-visible)?:ring|focus-visible:outline))",
+         exts=WEB, aggregate=True,
+         fix="Keep a visible :focus-visible style (2px ring, 3:1 contrast)."),
+    dict(id="F-07", sev="P1", cat="a11y", title="Input with placeholder but no label",
+         pattern=r"<(?:input|textarea)\b(?![^>]*\b(?:aria-label|aria-labelledby|id)=)(?![^>]*type=[\"'](?:hidden|submit|button)[\"'])[^>]*\bplaceholder=",
+         exts=MARKUP | CODE, aggregate=True, fix="Add a visible <label for> or aria-label; placeholder is not a label."),
+    dict(id="F-09", sev="P1", cat="a11y", title="Icon-only button without accessible name",
+         pattern=r"(?s)<button\b(?![^>]*aria-label)[^>]*>\s*<(?:svg|[A-Z][A-Za-z]*(?:Icon)?)\b[^<]*?/?>\s*(?:</svg>\s*)?</button>",
+         exts=MARKUP | CODE, multiline=True, aggregate=True, fix="Add aria-label to the button and aria-hidden to the icon."),
+    dict(id="F-13", sev="P1", cat="a11y", title="<html> without lang attribute",
+         pattern=r"<html\b(?![^>]*\blang=)[^>]*>", exts=MARKUP | CODE, fix="Add lang=\"en\" (or your language)."),
+    dict(id="F-14", sev="P2", cat="a11y", title="Vague link text",
+         pattern=r"(?i)>\s*(?:click here|here|read more|learn more|more)\s*</(?:a|Link)>", exts=MARKUP | CODE,
+         aggregate=True, fix="Say where the link goes."),
+    dict(id="F-16", sev="P1", cat="a11y", title="Paste blocked on input (breaks password managers)",
+         pattern=r"onPaste=\{[^}]*preventDefault|onpaste=[\"']return false", exts=MARKUP | CODE,
+         fix="Allow paste (WCAG 3.3.8 Accessible Authentication)."),
+    dict(id="F-01", sev="P2", cat="a11y", title="Light grey text classes (check contrast)",
+         pattern=r"\btext-(?:gray|slate|zinc|neutral|stone)-(?:300|400)\b", exts=MARKUP | CODE, aggregate=True,
+         confidence="low", fix="Body text needs 4.5:1 contrast; gray-400 on white is about 2.5:1."),
+
+    # ---------------- Technical / SEO ----------------
+    dict(id="T-02", sev="P1", cat="technical", title="Template page title left in",
+         pattern=r"(?i)<title>\s*(?:Vite \+ (?:React|Vue|TS)|React App|Create Next App|Vite App|Lovable App|My App|Document|Untitled)\s*</title>|title\s*:\s*[\"'](?:Create Next App|Vite \+ React|My App|Lovable App)[\"']",
+         exts=MARKUP | CODE, fix="Write a real, page-specific title and meta description."),
+    dict(id="T-06", sev="P1", cat="technical", title="noindex present (check it is not on production)",
+         pattern=r"(?i)noindex", exts=MARKUP | CODE | {".txt", ".json"}, not_paths=TEST_PATHS,
+         fix="Remove noindex from production pages."),
+    dict(id="T-12", sev="P2", cat="technical", title="localhost URL in shipped code",
+         pattern=r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?", exts=WEB - {".md", ".mdx"}, not_paths=TEST_PATHS + r"|vite\.config|next\.config|playwright\.config|\.env|[Rr][Ee][Aa][Dd][Mm][Ee]|(^|/)docs?/",
+         aggregate=True, fix="Use an environment-based base URL."),
+    dict(id="T-13", sev="P1", cat="technical", title="Mixed content (http:// asset)",
+         pattern=r"(?:src|href)=[\"']http://(?!localhost|127\.0\.0\.1|www\.w3\.org)", exts=MARKUP | CODE, aggregate=True,
+         fix="Load every asset over https."),
+    dict(id="T-14", sev="P1", cat="technical", title="Error swallowed (empty catch)",
+         pattern=r"catch\s*(?:\(\s*\w*\s*\))?\s*\{\s*\}|\.catch\(\s*\(\s*\w*\s*\)\s*=>\s*\{\s*\}\s*\)|except(?:\s+\w+)?:\s*pass\b",
+         exts=SERVER, aggregate=True, fix="Log the error to your tracker and show the user a recoverable message."),
+    dict(id="T-23", sev="P2", cat="technical", title="console.log left in code",
+         pattern=r"\bconsole\.log\(", exts=CODE, not_paths=TEST_PATHS + r"|scripts/", aggregate=True,
+         fix="Remove or replace with a logger."),
+    dict(id="T-23", sev="P2", cat="technical", title="TODO/FIXME left in code",
+         pattern=r"(?://|#|/\*|<!--)\s*(?:TODO|FIXME|HACK|XXX)\b", exts=SERVER | MARKUP, aggregate=True,
+         fix="Resolve or file as issues before launch."),
+    dict(id="T-24", sev="P2", cat="technical", title="TypeScript 'any'",
+         pattern=r":\s*any\b|\bas\s+any\b|<any>", exts={".ts", ".tsx"}, aggregate=True,
+         fix="Type the value; any hides bugs the compiler would catch."),
+    dict(id="T-26", sev="P2", cat="technical", title="<img> without width/height (layout shift)",
+         pattern=r"<img\s+(?![^>]*\bwidth=)[^>]*>", exts=MARKUP | {".js"}, aggregate=True,
+         fix="Set width and height (or aspect-ratio) so CLS stays under 0.1."),
+    dict(id="T-35", sev="P2", cat="technical", title="target=_blank without rel=noopener",
+         pattern=r"target=[\"']_blank[\"'](?![^>]*rel=[\"'][^\"']*noopener)", exts=MARKUP | CODE, aggregate=True,
+         fix="Add rel=\"noopener noreferrer\"."),
+
+    # ---------------- Design: AI slop tells ----------------
+    dict(id="D-01", sev="P2", cat="design", title="Default indigo/violet/purple gradient or accent",
+         pattern=r"\b(?:from|via|to|bg|text|border|ring)-(?:indigo|violet|purple)-[3-7]00\b|#(?:6366f1|8b5cf6|a855f7|7c3aed|4f46e5|9333ea)\b",
+         exts=WEB, aggregate=True, confidence="medium",
+         fix="Define 4-6 brand tokens and use them; only keep violet if it is your real brand colour."),
+    dict(id="D-02", sev="P2", cat="design", title="Gradient text",
+         pattern=r"bg-clip-text[^\"'`]*text-transparent|text-transparent[^\"'`]*bg-clip-text|-webkit-background-clip\s*:\s*text|background-clip\s*:\s*text",
+         exts=WEB, aggregate=True, fix="Use solid colour for headings and numbers."),
+    dict(id="D-03", sev="P2", cat="design", title="Side-tab accent border on rounded card",
+         pattern=r"\bborder-[lrse]-(?:[2-8])\b[^\"'`]*\brounded|\brounded[^\"'`]*\bborder-[lrse]-(?:[2-8])\b",
+         exts=WEB, aggregate=True, fix="Use a full border, a background tint, or nothing."),
+    dict(id="D-11", sev="P2", cat="design", title="Glassmorphism / blur used as decoration",
+         pattern=r"\bbackdrop-blur(?:-\w+)?\b|backdrop-filter\s*:\s*blur", exts=WEB, aggregate=True, confidence="low",
+         fix="Keep blur only where it solves a layering problem (overlays, sticky nav)."),
+    dict(id="D-12", sev="P2", cat="design", title="Decorative blurred blobs / orbs",
+         pattern=r"\bblur-(?:2xl|3xl|\[\d{2,}px\])\b[^\"'`]*\b(?:rounded-full|absolute)|\babsolute\b[^\"'`]*\brounded-full\b[^\"'`]*\bblur-(?:2xl|3xl)",
+         exts=WEB, aggregate=True, fix="Replace with a real product visual or remove."),
+    dict(id="D-14", sev="P2", cat="design", title="Bounce / elastic easing",
+         pattern=r"\banimate-bounce\b|easeOutBack|easeInOutBack|\belastic\b|bounce\s*:\s*0?\.[3-9]", exts=WEB, aggregate=True,
+         fix="Use a standard ease-out; respect prefers-reduced-motion."),
+    dict(id="D-22", sev="P2", cat="design", title="Buzzword copy",
+         pattern=r"(?i)\b(?:empower(?:s|ing)?|unlock(?:s|ing)? (?:your|the)|seamless(?:ly)?|revolutioni[sz]e|elevate (?:your|the)|supercharge|next[- ]gen(?:eration)?|cutting[- ]edge|game[- ]chang(?:er|ing)|unleash|effortless(?:ly)?|world[- ]class|leverage the power|in today's (?:fast-paced|digital))\b",
+         exts=MARKUP | CODE, not_paths=TEST_PATHS, aggregate=True,
+         fix="Replace with a specific claim and a number: what it does, for whom, how much faster."),
+    dict(id="D-23", sev="P2", cat="design", title="Generic CTA text",
+         pattern=r"(?i)>\s*(?:get started|learn more|sign up now|start now|try it now|discover more)\s*<", exts=MARKUP | CODE,
+         aggregate=True, confidence="low", fix="Name the outcome: 'Create your first invoice', 'Book a 15-min demo'."),
+]
+
+EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F2FF]")
+# Emoji inside JSX/HTML text nodes or icon props
+EMOJI_RULE = dict(id="D-13", sev="P2", cat="design", title="Emoji used as icons", exts=MARKUP | CODE,
+                  fix="Use one consistent icon set (Lucide, Phosphor) with aria-hidden, or none.")
+
+
+def compile_rules():
+    out = []
+    for r in RULES:
+        flags = 0
+        rr = dict(r)
+        rr["rx"] = re.compile(r["pattern"], flags)
+        rr["skip_rx"] = re.compile(r["skip_if"]) if r.get("skip_if") else None
+        rr["only_rx"] = re.compile(r["only_paths"]) if r.get("only_paths") else None
+        rr["not_rx"] = re.compile(r["not_paths"]) if r.get("not_paths") else None
+        rr.setdefault("scope", "source")
+        rr.setdefault("confidence", "high")
+        out.append(rr)
+    return out

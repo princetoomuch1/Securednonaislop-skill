@@ -1,0 +1,17 @@
+{
+  "name": "launchly",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
+  "dependencies": {
+    "next": "15.0.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "stripe": "^16.0.0",
+    "openai": "^4.60.0",
+    "framer-motion": "^11.0.0",
+    "lodahs": "^1.0.0",
+    "supabase-auth-guard-pro-kit": "^2.1.0"
+  }
+}

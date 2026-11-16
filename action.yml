@@ -1,0 +1,45 @@
+name: "vibe-preflight"
+description: "Pre-launch audit for AI-built apps: secrets, Supabase/Firebase rules, auth gaps, fake social proof, consent, a11y, SEO, AI slop."
+author: "Prince K. Parmar"
+branding:
+  icon: "shield"
+  color: "orange"
+inputs:
+  path:
+    description: "Project root to scan"
+    default: "."
+  jurisdiction:
+    description: "Comma list: eu,uk,us,in (tunes legal severity)"
+    default: "eu,uk,us"
+  fail-on:
+    description: "P0 (default), P1, or none"
+    default: "P0"
+  offline:
+    description: "Skip npm/PyPI registry lookups"
+    default: "false"
+outputs:
+  verdict:
+    description: "BLOCK, FIX FIRST or SHIP"
+    value: ${{ steps.scan.outputs.verdict }}
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - id: scan
+      shell: bash
+      run: |
+        set +e
+        OFF=""
+        if [ "${{ inputs.offline }}" = "true" ]; then OFF="--offline"; fi
+        python3 "${{ github.action_path }}/skills/vibe-preflight/scripts/preflight.py" scan "${{ inputs.path }}" \
+          --out "${{ inputs.path }}/.preflight" --jurisdiction "${{ inputs.jurisdiction }}" --fail-on "${{ inputs.fail-on }}" $OFF
+        CODE=$?
+        VERDICT=$(python3 -c "import json;print(json.load(open('${{ inputs.path }}/.preflight/report.json'))['verdict'])" 2>/dev/null || echo UNKNOWN)
+        echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+        cat "${{ inputs.path }}/.preflight/report.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        if [ "${{ inputs.fail-on }}" = "none" ]; then exit 0; fi
+        if [ "$CODE" = "1" ]; then exit 1; fi
+        if [ "$CODE" = "2" ] && [ "${{ inputs.fail-on }}" = "P1" ]; then exit 1; fi
+        exit 0

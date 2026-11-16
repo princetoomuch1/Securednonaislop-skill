@@ -1,0 +1,10 @@
+{
+  "name": "vibe-preflight",
+  "version": "1.0.0",
+  "description": "Pre-launch audit and guardrails for AI-built apps: open databases, leaked keys, missing auth, fake testimonials, trackers before consent, hallucinated packages, accessibility, SEO and AI-slop design.",
+  "author": { "name": "Prince K. Parmar", "url": "https://github.com/princetoomuch1" },
+  "homepage": "https://github.com/princetoomuch1/Securednonaislop-skill",
+  "repository": "https://github.com/princetoomuch1/Securednonaislop-skill",
+  "license": "MIT",
+  "keywords": ["vibe-coding", "security", "audit", "supabase", "rls", "accessibility", "gdpr", "seo", "ai-slop", "pre-launch"]
+}
